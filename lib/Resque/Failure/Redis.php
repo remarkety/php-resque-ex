@@ -27,7 +27,7 @@ class Resque_Failure_Redis implements Resque_Failure_Interface
 		$data['backtrace'] = explode("\n", $exception->getTraceAsString());
 		$data['worker'] = (string)$worker;
 		$data['queue'] = $queue;
-		Resque::Redis()->setex('failed:'.$payload['id'], 3600*14, serialize($data));
+		Resque::redis()->setex('failed:'.$payload['id'], 3600*14, serialize($data));
 	}
 
 	static public function get($jobId)

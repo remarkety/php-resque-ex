@@ -1,4 +1,4 @@
-Php-Resque-ex: Resque for PHP [![Build Status](https://secure.travis-ci.org/wa0x6e/php-resque-ex.png)](http://travis-ci.org/wa0x6e/php-resque-ex)
+Php-Resque-ex: Resque for PHP [![Build Status](https://secure.travis-ci.org/kamisama/php-resque-ex.png)](http://travis-ci.org/kamisama/php-resque-ex)
 ===========================================
 
 Resque is a Redis-backed library for creating background jobs, placing
@@ -53,7 +53,7 @@ You can easily retrieve logs for a failed jobs in the redis database, their keys
 
 ### Command Line tool
 
-Fresque is shipped by default to manage your workers. See [Fresque Documentation](https://github.com/wa0x6e/Fresque) for usage.
+Fresque is shipped by default to manage your workers. See [Fresque Documentation](https://github.com/kamisama/Fresque) for usage.
 
 ## Installation
 
@@ -72,10 +72,6 @@ Download Composer
 Install dependencies
 
 	$ php composer.phar install
-
-#### Warning
-
-php-resque requires the pcntl php extension, not available on Windows platform. Composer installation will fail if you're trying to install this package on Windows machine. If you still want to continue with the installation at your own risk, execute the composer install command with the `--ignore-platform-reqs` option.
 
 ## Usage
 
@@ -107,4 +103,4 @@ If one of these two environement variable is missing, it will default to *Rotati
 ## Contributors ##
 
 * [chrisboulton](https://github.com/chrisboulton/php-resque) for the original port
-* wa0x6e
+* kamisama

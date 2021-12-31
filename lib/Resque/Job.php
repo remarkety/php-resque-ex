@@ -95,13 +95,17 @@ class Resque_Job
 	 * @param string $queue The name of the queue to check for a job in.
 	 * @return null|object Null when there aren't any waiting jobs, instance of Resque_Job when a job was found.
 	 */
-	public static function reserve($queue)
+	public static function reserve($queue, $scoreOffset = 0)
 	{
 		$payload = Resque::pop($queue);
 		if(!is_array($payload)) {
 			return false;
 		}
 
+		if (Resque::$useQos) {
+			$score = time() + $scoreOffset;
+			Resque::redis()->zadd('queues', $score, $queue);
+		}
 		return new Resque_Job($queue, $payload);
 	}
 
@@ -110,14 +114,14 @@ class Resque_Job
 	 *
 	 * @param int $status Status constant from Resque_Job_Status indicating the current status of a job.
 	 */
-	public function updateStatus($status)
+	public function updateStatus($status,$message = null,$completed = null, $total = null)
 	{
 		if(empty($this->payload['id'])) {
 			return;
 		}
 
 		$statusInstance = new Resque_Job_Status($this->payload['id']);
-		$statusInstance->update($status);
+		$statusInstance->update($status,$message, $completed,$total);
 	}
 
 	/**
@@ -196,6 +200,8 @@ class Resque_Job
 				$instance->setUp();
 			}
 
+//			$jobId = $instance->job->payload['id'];
+//			$instance->setJobId($jobId);
 			$instance->perform();
 
 			if(method_exists($instance, 'tearDown')) {

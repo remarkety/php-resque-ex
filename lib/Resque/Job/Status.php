@@ -48,13 +48,20 @@ class Resque_Job_Status
 	 *
 	 * @param string $id The ID of the job to monitor the status of.
 	 */
-	public static function create($id, $status = self::STATUS_WAITING)
+	public static function create($id, $status = self::STATUS_WAITING, $message = null, $completed = null, $total = null)
 	{
 		$statusPacket = array(
 			'status' => $status,
 			'updated' => time(),
 			'started' => time(),
 		);
+        if (!is_null($completed))
+            $statusPacket['completed'] = (int)$completed;
+        if (!is_null($total))
+            $statusPacket['total'] = (int)$total;
+        if (!is_null($message))
+            $statusPacket['message'] = $message;
+
 		Resque::redis()->set('job:' . $id . ':status', json_encode($statusPacket));
 	}
 
@@ -84,7 +91,7 @@ class Resque_Job_Status
 	 *
 	 * @param int The status of the job (see constants in Resque_Job_Status)
 	 */
-	public function update($status)
+	public function update($status, $message = null, $completed = null, $total = null)
 	{
 		if(!$this->isTracking()) {
 			return;
@@ -94,7 +101,15 @@ class Resque_Job_Status
 			'status' => $status,
 			'updated' => time(),
 		);
-		Resque::redis()->set((string)$this, json_encode($statusPacket));
+
+        if (!is_null($completed))
+            $statusPacket['completed'] = (int)$completed;
+        if (!is_null($total))
+            $statusPacket['total'] = (int)$total;
+        if (!is_null($message))
+            $statusPacket['message'] = $message;
+
+        Resque::redis()->set((string)$this, json_encode($statusPacket));
 
 		// Expire the status for completed jobs after 24 hours
 		if(in_array($status, self::$completeStatuses)) {
@@ -122,6 +137,14 @@ class Resque_Job_Status
 		return $statusPacket['status'];
 	}
 
+	public static function getStatus($jobId) {
+        $statusPacket = Resque::redis()->get('job:' . $jobId . ':status');
+        if (!empty($statusPacket)) {
+            return json_decode($statusPacket, true);
+        } else {
+            return false;
+        }
+    }
 	/**
 	 * Stop tracking the status of a job.
 	 */

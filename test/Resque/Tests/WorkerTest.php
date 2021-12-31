@@ -1,6 +1,26 @@
 <?php
 require_once dirname(__FILE__) . DIRECTORY_SEPARATOR . 'bootstrap.php';
 
+
+class Test_Job_Timeout {
+
+    public $args = [];
+    public function getJobQueueId(){
+        return 1;
+    }
+
+    public function perform(){
+        if(!empty($this->args['sleep'])){
+            sleep($this->args['sleep']);
+        }
+        return true;
+    }
+    public function timeoutLimit()
+    {
+        return 1;
+    }
+}
+
 /**
  * Resque_Worker tests.
  *
@@ -134,6 +154,54 @@ class Resque_Tests_WorkerTest extends Resque_Tests_TestCase
 
         $job = $worker->reserve();
         $this->assertEquals('queue2', $job->queue);
+    }
+
+    public function testWorkerRetrievedJobBasedOnQos() {
+        $worker = new Resque_Worker('*');
+        $worker->registerWorker();
+        $worker->logLevel = Resque_Worker::LOG_NONE;
+        $worker->logOutput = fopen('php://memory', 'r+');
+
+        Resque::enqueue('queue1', 'Test_Job_1_1');
+        Resque::enqueue('queue1', 'Test_Job_1_2');
+
+        Resque::enqueue('queue2', 'Test_Job_2_1');
+        Resque::enqueue('queue2', 'Test_Job_2_2');
+
+        $expectedOrder = ['queue1', 'queue2', 'queue1', 'queue2'];
+        $i = 1;
+        foreach ($expectedOrder as $expectedQueue) {
+            sleep(1);// QoS is in a per-second resolution
+            $job = $worker->reserve();
+            $this->assertEquals($expectedQueue, $job->queue, "Queue $i should have been $expectedQueue");
+
+            $i++;
+        }
+    }
+
+    public function testWorkerRetrievedJobBasedOnQosWithOffset() {
+        $worker = new Resque_Worker('*');
+        $worker->registerWorker();
+        $worker->logLevel = Resque_Worker::LOG_NONE;
+        $worker->logOutput = fopen('php://memory', 'r+');
+
+        Resque::enqueue('queue1', 'Test_Job_1_1');
+        Resque::enqueue('queue1', 'Test_Job_1_2');
+        Resque::enqueue('queue2', 'Test_Job_2_1');
+        Resque::enqueue('queue2', 'Test_Job_2_2');
+        Resque::enqueue('queue2', 'Test_Job_2_3');
+        Resque::enqueue('queue3', 'Test_Job_3_1');
+        Resque::enqueue('queue3', 'Test_Job_3_2');
+
+        Resque::setOffset('queue1', 3);
+        $expectedOrder = ['queue1', 'queue2', 'queue3', 'queue2', 'queue3', 'queue1', 'queue2'];
+        $i = 1;
+        foreach ($expectedOrder as $expectedQueue) {
+            sleep(1);// QoS is in a per-second resolution
+            $job = $worker->reserve();
+            $this->assertEquals($expectedQueue, $job->queue, "Queue $i should have been $expectedQueue");
+            $i++;
+        }
     }
 
     public function testWorkerDoesNotWorkOnUnknownQueues()
@@ -334,6 +402,36 @@ class Resque_Tests_WorkerTest extends Resque_Tests_TestCase
         $lines = explode("\n", $output);
         $this->assertEquals(1, count($lines) -1);
         $this->assertEquals('[' . $now . '] x', $lines[0]);
+    }
+
+    public function testTimeoutRetry(){
+        $worker = new Resque_Worker('jobs');
+        $worker->registerWorker();
+        $worker->setMaxRetries(2);
+        //no timeout without fork
+        $worker->setFork(false);
+        $args = ['sleep' => 2];
+        Resque::enqueue('jobs', 'Test_Job_Timeout', $args);
+
+        $worker->work(0);
+        $this->assertEquals(1, Resque_Stat::get('success'));
+
+        //timeout with fork
+        $worker->setFork(true);
+        Resque::enqueue('jobs', 'Test_Job_Timeout', $args);
+        $worker->work(0);
+        $this->assertEquals(2, Resque_Stat::get('failed'));
+        $this->assertEquals(1, Resque::getFailedCount());
+
+        $failedItems = Resque::getFailed();
+        $this->assertCount(1, $failedItems);
+
+        //timeout without sleep
+        $args = ['sleep' => 0];
+        Resque::enqueue('jobs', 'Test_Job_Timeout', $args);
+        $worker->work(0);
+        $this->assertEquals(2, Resque_Stat::get('success'));
+
     }
 
 }

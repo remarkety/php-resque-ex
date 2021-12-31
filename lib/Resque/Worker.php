@@ -1,4 +1,6 @@
 <?php
+use Interamind\Helpers\TimerWithStats;
+
 require_once dirname(__FILE__) . '/Stat.php';
 require_once dirname(__FILE__) . '/Event.php';
 require_once dirname(__FILE__) . '/Job.php';
@@ -94,6 +96,19 @@ class Resque_Worker
 
     protected $logger = null;
 
+    protected $fork = true;
+
+    protected $max_retries = 0;
+
+    public function setMaxRetries($max){
+        $this->max_retries = $max;
+    }
+    /**
+     * @param $fork boolean
+     */
+    public function setFork($fork) {
+        $this->fork = $fork;
+    }
     /**
      * Return all workers known to Resque as instantiated instances.
      * @return array
@@ -188,12 +203,16 @@ class Resque_Worker
      *
      * @param int $interval How often to check for new jobs across the queues.
      */
-    public function work($interval = 5)
+    public function work($interval = 5, $maxJobs = null, TimerWithStats $timer = null)
     {
         $this->updateProcLine('Starting');
         $this->startup();
 
-        while (true) {
+        $jobsTaken = 0;
+        while (empty($maxJobs) || $jobsTaken < $maxJobs) {
+            \Interamind\Service\Factory::getStatsDService()->startTiming('qosdipatcher.dispatch_next');
+            $timer && $timer->start();
+//             pcntl_signal_dispatch();    // Ensure signals get processed
             if ($this->shutdown) {
                 break;
             }
@@ -224,45 +243,137 @@ class Resque_Worker
                 usleep($interval * 1000000);
                 continue;
             }
-
+            $jobsTaken++;
             $this->log(array('message' => 'got ' . $job, 'data' => array('type' => 'got', 'args' => $job)), self::LOG_TYPE_INFO);
             Resque_Event::trigger('beforeFork', $job);
+            \Resque_Stat::incr("in_progress");
             $this->workingOn($job);
 
             $workerName = $this->hostname . ':'.getmypid();
 
-            $this->child = $this->fork();
+            if ($this->fork) {
+                $this->child = $this->fork();
 
-            // Forked and we're the child. Run the job.
-            if ($this->child === 0 || $this->child === false) {
-                $status = 'Processing ID:' . $job->payload['id'] .  ' in ' . $job->queue;
+                // Forked and we're the child. Run the job.
+                $jobInstance = $job->getInstance();
+                if ($this->child === 0 || $this->child === false) {
+                    $status = 'Processing ID:' . $job->payload['id'] . ' in ' . $job->queue;
+                    $this->updateProcLine($status);
+                    $this->log(array(
+                        'message' => $status,
+                        'data' => array('type' => 'process', 'worker' => $workerName, 'job_id' => $job->payload['id'])
+                    ), self::LOG_TYPE_INFO);
+
+                    $timeoutlimit = false;
+                    if(method_exists($jobInstance, 'timeoutLimit')){
+                        $timeoutlimit = $jobInstance->timeoutLimit();
+                    }
+
+                    if($timeoutlimit){
+                        //create a child process that will kill this process
+                        $killerProcessId = pcntl_fork();
+                        if ($killerProcessId){
+                            //runs the job and logs stack trace on timeout
+                            pcntl_signal(SIGTERM, function ($signo){
+                                try {
+                                    throw new \Exception();
+                                } catch (\Exception $e) {
+                                    \Interamind_Helpers_Log::warning("Resque timed out - recorded stack trace for $signo", $e);
+                                }
+                                exit(20);
+                            });
+                            \Interamind\Service\Factory::getStatsDService()->endTiming('qosdipatcher.dispatch_next');
+                            $this->perform($job);
+                            \Interamind_Helpers_Log::debug("Job finished", ['jobQueue' => $job->queue, 'jobId' => $job->payload['id']]);
+                            posix_kill($killerProcessId, SIGKILL);
+                        } else {
+                            //kills the job from a separate process after some timeout
+                            $this->updateProcLine("Child process for killing parent (".posix_getppid().")");
+                            sleep($timeoutlimit);
+                            posix_kill(posix_getppid(), SIGKILL);
+                            \Interamind_Helpers_Log::warning("Job timeout", ['jobQueue' => $job->queue, 'jobId' => $job->payload['id'], 'timeout' => $timeoutlimit]);
+                            $this->retryJob($job, $jobInstance);
+                            exit(0);
+                        }
+                    } else {
+                        //directly perform the job
+                        \Interamind\Service\Factory::getStatsDService()->endTiming('qosdipatcher.dispatch_next');
+                        $this->perform($job);
+                    }
+
+                    if ($this->child === 0) {
+                        exit(0);
+                    }
+                }
+
+                if ($this->child > 0) {
+                    // Parent process, sit and wait
+                    $status = 'Forked ' . $this->child . ' for ID:' . $job->payload['id'];
+                    $this->updateProcLine($status);
+                    $this->log(array(
+                        'message' => $status,
+                        'data' => array('type' => 'fork', 'worker' => $workerName, 'job_id' => $job->payload['id'])
+                    ), self::LOG_TYPE_DEBUG);
+
+                    // Wait until the child process finishes before continuing
+                    pcntl_wait($status);
+                    $exitStatus = pcntl_wexitstatus($status);
+//                    if($exitStatus == )
+                    if($exitStatus == 20){
+                        Interamind_Helpers_Log::error('Resque Job retry', [
+                            'status' => $exitStatus,
+                            'name' => $workerName,
+                            'job_id' => $job->payload['id']
+                        ]);
+                        //retry if killed with timeout or via terminal
+                        $this->retryJob($job, $jobInstance);
+                    }
+                    if ($exitStatus !== 0) {
+                        Interamind_Helpers_Log::error('Resque Job fail', [
+                            'status' => $exitStatus,
+                            'name' => $workerName,
+                            'job_id' => $job->payload['id']
+                        ]);
+                        $job->fail(new Resque_Job_DirtyExitException('Job exited with exit code ' . $exitStatus));
+                    } else {
+                        \Resque_Stat::incr('success');
+                    }
+                }
+
+                $this->child = null;
+            } else {
+                $status = 'Running job ID:' . $job->payload['id']." without forking";
                 $this->updateProcLine($status);
-                $this->log(array('message' => $status, 'data' => array('type' => 'process', 'worker' => $workerName, 'job_id' => $job->payload['id'])), self::LOG_TYPE_INFO);
-                $this->perform($job);
-                if ($this->child === 0) {
-                    exit(0);
+                try {
+                    if ($this->perform($job))
+                        \Resque_Stat::incr('success');
+                } catch (\Exception $e) {
+                    $job->fail(new Resque_Job_DirtyExitException('Job failed with error ' . $e->getMessage()));
                 }
             }
-
-            if ($this->child > 0) {
-                // Parent process, sit and wait
-                $status = 'Forked ' . $this->child . ' for ID:' . $job->payload['id'];
-                $this->updateProcLine($status);
-                $this->log(array('message' => $status, 'data' => array('type' => 'fork', 'worker' => $workerName, 'job_id' => $job->payload['id'])), self::LOG_TYPE_DEBUG);
-
-                // Wait until the child process finishes before continuing
-                pcntl_wait($status);
-                $exitStatus = pcntl_wexitstatus($status);
-                if ($exitStatus !== 0) {
-                    $job->fail(new Resque_Job_DirtyExitException('Job exited with exit code ' . $exitStatus));
-                }
-            }
-
-            $this->child = null;
+            \Resque_Stat::decr("in_progress");
             $this->doneWorking();
+            $timer && $timer->stop();
         }
-
         $this->unregisterWorker();
+    }
+
+    /**
+     * @param object $job
+     * @param $jobInstance
+     */
+    protected function retryJob($job, $jobInstance){
+        $jobArgs = $job->getArguments();
+        $retries = isset($jobArgs['retries']) ? $jobArgs['retries'] + 1 : 1;
+        if(!empty($this->max_retries) && $retries < $this->max_retries) {
+            //checks maximum retries
+            $jobArgs['retries'] = $retries;
+            \Resque::enqueue($job->queue, get_class($jobInstance), $jobArgs, true);
+            \Resque::setOffset($job->queue, 5);
+        } else {
+            //push to failed queue
+            \Resque::failed($job->queue, get_class($jobInstance), $jobArgs);
+        }
     }
 
     /**
@@ -280,10 +391,11 @@ class Resque_Worker
         } catch (Exception $e) {
             $this->log(array('message' => $job . ' failed: ' . $e->getMessage(), 'data' => array('type' => 'fail', 'log' => $e->getMessage(), 'job_id' => $job->payload['id'], 'time' => round(microtime(true) - $startTime, 3) * 1000)), self::LOG_TYPE_ERROR);
             $job->fail($e);
-            return;
+            return false;
         }
 
         $job->updateStatus(Resque_Job_Status::STATUS_COMPLETE);
+        return true;
     }
 
     /**
@@ -298,11 +410,15 @@ class Resque_Worker
             return;
         }
         foreach ($queues as $queue) {
+            $scoreOffset = \Resque::getOffset($queue);
             $this->log(array('message' => 'Checking ' . $queue, 'data' => array('type' => 'check', 'queue' => $queue)), self::LOG_TYPE_DEBUG);
-            $job = Resque_Job::reserve($queue);
+            $job = Resque_Job::reserve($queue, $scoreOffset);
             if ($job) {
                 $this->log(array('message' => 'Found job on ' . $queue, 'data' => array('type' => 'found', 'queue' => $queue)), self::LOG_TYPE_DEBUG);
+                \Resque_Stat::decr('pending');
                 return $job;
+            } else {
+                \Resque_Event::trigger("queueEmpty", $queue);
             }
         }
 
@@ -327,7 +443,6 @@ class Resque_Worker
         }
 
         $queues = Resque::queues();
-        sort($queues);
         return $queues;
     }
 
@@ -360,7 +475,8 @@ class Resque_Worker
         $this->log(array('message' => 'Starting worker ' . $this, 'data' => array('type' => 'start', 'worker' => (string) $this)), self::LOG_TYPE_INFO);
 
         $this->registerSigHandlers();
-        $this->pruneDeadWorkers();
+        // Commented by Guy - Seems to cause massive performance issues
+        // $this->pruneDeadWorkers();
         Resque_Event::trigger('beforeFirstFork', $this);
         $this->registerWorker();
     }
@@ -374,7 +490,10 @@ class Resque_Worker
      */
     protected function updateProcLine($status)
     {
-        if (function_exists('setproctitle')) {
+        if (function_exists('cli_set_process_title')) {
+            cli_set_process_title('resque-' . Resque::VERSION . ': ' . $status);
+        }
+        else if (function_exists('setproctitle')) {
             setproctitle('resque-' . Resque::VERSION . ': ' . $status);
         }
     }
@@ -398,7 +517,7 @@ class Resque_Worker
         pcntl_signal(SIGTERM, array($this, 'shutDownNow'));
         pcntl_signal(SIGINT, array($this, 'shutDownNow'));
         pcntl_signal(SIGQUIT, array($this, 'shutdown'));
-        pcntl_signal(SIGUSR1, array($this, 'killChild'));
+//        pcntl_signal(SIGUSR1, array($this, 'killChild'));
         pcntl_signal(SIGUSR2, array($this, 'pauseProcessing'));
         pcntl_signal(SIGCONT, array($this, 'unPauseProcessing'));
         pcntl_signal(SIGPIPE, array($this, 'reestablishRedisConnection'));
@@ -471,7 +590,7 @@ class Resque_Worker
             posix_kill($this->child, SIGKILL);
             $this->child = null;
         } else {
-            $this->log(array('message' => 'Child ' . $this->child . ' not found, restarting.', 'data' => array('type' => 'kill', 'child' => $this->child)), self::LOG_TYPE_ERROR);
+            $this->log(array('message' => 'Child ' . $this->child . ' not found, shutting down.', 'data' => array('type' => 'kill', 'child' => $this->child)), self::LOG_TYPE_ERROR);
             $this->shutdown();
         }
     }
@@ -488,6 +607,7 @@ class Resque_Worker
     {
         $workerPids = $this->workerPids();
         $workers = self::all();
+        $found = false;
         foreach ($workers as $worker) {
             if (is_object($worker)) {
                 list($host, $pid, $queues) = explode(':', (string)$worker, 3);
@@ -496,6 +616,7 @@ class Resque_Worker
                 }
                 $this->log(array('message' => 'Pruning dead worker: ' . (string)$worker, 'data' => array('type' => 'prune')), self::LOG_TYPE_DEBUG);
                 $worker->unregisterWorker();
+                $found = true;
             }
         }
     }
@@ -508,11 +629,18 @@ class Resque_Worker
      */
     public function workerPids()
     {
-        $pids = array();
-        exec('ps -A -o pid,comm | grep [r]esque', $cmdOutput);
+    	return array();
+        $cli = $_SERVER['argv'][0];
+        $script = basename($cli);
+        exec("ps -A -o pid,command | grep $script", $cmdOutput);
         foreach ($cmdOutput as $line) {
-            list($pids[]) = explode(' ', trim($line), 2);
+            list($pids1[]) = explode(' ', trim($line), 2);
         }
+        exec("ps -A -o pid,command | grep resque-", $cmdOutput);
+        foreach ($cmdOutput as $line) {
+            list($pids2[]) = explode(' ', trim($line), 2);
+        }
+        $pids = array_merge($pids1,$pids2);
         return $pids;
     }
 
@@ -699,5 +827,9 @@ class Resque_Worker
     public function getStat($stat)
     {
         return Resque_Stat::get($stat . ':' . $this);
+    }
+
+    public function wasShutdown() {
+        return $this->shutdown;
     }
 }
