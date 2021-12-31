@@ -1,5 +1,5 @@
 {
-	"name": "kamisama/php-resque-ex",
+	"name": "remarkety/php-resque-ex",
 	"type": "library",
 	"description": "Redis backed library for creating background jobs and processing them later. PHP port based on resque for Ruby.",
 	"keywords": ["job", "background", "redis", "resque", "queue", "php"],
@@ -14,10 +14,14 @@
 		{
 			"name": "Chris Boulton",
 			"email": "chris@bigcommerce.com"
+		},
+		{
+			"name": "Guy Harel",
+			"email": "guy@remarkety.com"
 		}
 	],
 	"require": {
-		"php": ">=5.3.0",
+		"php": "~7.4.0",
 		"ext-pcntl": "*",
 		"monolog/monolog": ">=1.2.0",
 		"kamisama/monolog-init": ">=0.1.1"
