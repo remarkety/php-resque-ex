@@ -66,11 +66,14 @@ class Redisent {
         fclose($this->__sock);
     }
 
+    /**
+     * @throws RedisException
+     */
     function __call($name, $args) {
 
         /* Build the Redis unified protocol command */
         array_unshift($args, strtoupper($name));
-        $command = sprintf('*%d%s%s%s', count($args), CRLF, implode(array_map(array($this, 'formatArgument'), $args), CRLF), CRLF);
+        $command = sprintf('*%d%s%s%s', count($args), CRLF, implode(CRLF, array_map(array($this, 'formatArgument'), $args),), CRLF);
 
         /* Open a Redis connection and execute the command */
         for ($written = 0; $written < strlen($command); $written += $fwrite) {
@@ -86,7 +89,6 @@ class Redisent {
             /* Error reply */
             case '-':
                 throw new RedisException(substr(trim($reply), 4));
-                break;
             /* Inline reply */
             case '+':
                 $response = substr(trim($reply), 1);
@@ -138,7 +140,7 @@ class Redisent {
                 break;
             default:
                 throw new RedisException("invalid server response: {$reply}");
-                break;
+
         }
         /* Party on */
         return $response;
